@@ -7,7 +7,6 @@ from typing import Dict, Any, List, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-from dateutil.relativedelta import relativedelta
 
 try:
     import gdown
@@ -20,6 +19,7 @@ st.caption("Incolla un link Google Drive (XLSX/Google Sheets) **oppure** carica 
 
 # ---------------------- Helpers ----------------------
 PAIR_DEFAULT = "SOL/USDC"
+EPS = 1e-12  # per arrotondamenti numerici
 
 def extract_drive_id(url: str) -> str | None:
     """Estrae il fileId da vari formati di URL Google Drive/Sheets."""
@@ -57,7 +57,7 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> str:
     raise KeyError(f"Colonna non trovata: {candidates}")
 
 def sanitize_orders(df_raw: pd.DataFrame) -> pd.DataFrame:
-    # Tieni solo BUY/SELL e normalizza nomi colonna
+    """Normalizza l'export 'Storico Ordini' (consigliato)."""
     type_col = _find_col(df_raw, ["Type"])
     df = df_raw[df_raw[type_col].isin(["BUY", "SELL"])].copy()
 
@@ -85,8 +85,12 @@ def sanitize_orders(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
-def fifo_trades(orders: pd.DataFrame, pair: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Accoppia BUY->SELL in FIFO, consentendo split (parziali)."""
+def fifo_trades_per_match(orders: pd.DataFrame, pair: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    BUY→SELL FIFO *completo* con split:
+    - ogni SELL consuma più BUY finché la qty del SELL va a zero
+    - ogni abbinamento parziale genera un 'trade' (conteggio per-match)
+    """
     df = orders[orders["pair"] == pair].copy()
     if df.empty:
         return [], {"start": None, "end": None, "totalMoved": 0.0}
@@ -99,7 +103,7 @@ def fifo_trades(orders: pd.DataFrame, pair: str) -> Tuple[List[Dict[str, Any]], 
             buy_q.append(o.to_dict())
         elif o["type"] == "SELL":
             sell_qty = float(o["qty"])
-            while sell_qty > 1e-12 and buy_q:
+            while sell_qty > EPS and buy_q:
                 b = buy_q[0]
                 take = float(min(b["qty"], sell_qty))
                 pnl = (float(o["price"]) - float(b["price"])) * take
@@ -117,7 +121,7 @@ def fifo_trades(orders: pd.DataFrame, pair: str) -> Tuple[List[Dict[str, Any]], 
                 })
                 b["qty"] -= take
                 sell_qty -= take
-                if b["qty"] <= 1e-12:
+                if b["qty"] <= EPS:
                     buy_q.pop(0)
 
     start = df["date"].min()
@@ -245,8 +249,8 @@ else:
         st.exception(e)
         st.stop()
 
-    # --- Calcolo trades e KPI ---
-    trades, meta = fifo_trades(orders, pair)
+    # --- Calcolo trades e KPI (PER-MATCH) ---
+    trades, meta = fifo_trades_per_match(orders, pair)
     residual_cfg = {"qty": res_qty, "avgCost": res_avg, "targetPrice": res_target}
     result = compute_kpis(trades, meta, residual_cfg)
 
@@ -261,28 +265,29 @@ else:
 
     st.divider()
 
-    # ======== KPI principali (layout e ordine richiesto) ========
-    # Colonna sinistra: PNL totale (con residuo), Numero trade, Success rate
+    # ======== KPI principali (ordine richiesto) ========
     col_left, col_mid, col_right = st.columns(3)
     with col_left:
         st.metric("PNL totale (con residuo)", f"{format_number(result['pnl']['totalWithResidual'])} USDC")
         st.metric("Numero di trade", result["counts"]["trades"])
         st.metric("Success rate", f"{format_number(result['counts']['successRatePct'])}%")
 
-    # Colonna centrale: Totale USDC mossi -> Guadagno mensile -> PNL medio per trade -> Valore residuo (ultimo)
     with col_mid:
         st.metric("Totale USDC mossi", f"{format_number(result['sizes']['totalUSDCMoved'])} USDC")
         st.metric("Guadagno mensile medio", f"{format_number(result['monthlyAvgGain'])} USDC")
         st.metric("PNL medio per trade", f"{format_number(result['perTrade']['avgPnl'])} USDC")
         st.metric("Valore residuo a target", f"{format_number(result['pnl']['residual']['value'])} USDC")
 
-    # Colonna destra: altre utili – Size media, Durata media (formattata), PNL totale (senza residuo) e info residuo
     with col_right:
         st.metric("Size media per trade", f"{format_number(result['sizes']['avgTradeUSDC'])} USDC")
         st.metric("Durata media trade", format_duration(result['perTrade']['avgDurationMin']))
         st.metric("PNL totale (senza residuo)", f"{format_number(result['pnl']['total'])} USDC")
 
-    st.caption(f"Residuo: {int(result['pnl']['residual']['qty'])} SOL @ {format_number(result['pnl']['residual']['avgCost'])} → target {format_number(result['pnl']['residual']['targetPrice'])} | PnL residuo: {format_number(result['pnl']['residual']['pnl'])} USDC")
+    st.caption(
+        f"Residuo: {int(result['pnl']['residual']['qty'])} SOL @ {format_number(result['pnl']['residual']['avgCost'])} → "
+        f"target {format_number(result['pnl']['residual']['targetPrice'])} | "
+        f"PnL residuo: {format_number(result['pnl']['residual']['pnl'])} USDC"
+    )
 
     st.divider()
 
@@ -328,7 +333,6 @@ else:
                 "pnl":"PnL (USDC)",
                 "dur_min":"Durata"
             }, inplace=True)
-            # Format durations
             df10["Durata"] = df10["Durata"].map(format_duration)
             st.dataframe(df10, use_container_width=True)
             st.info(f"PnL ultimi 10gg: **{format_number(result['last10d']['pnl'])} USDC** su {len(last10)} trade")
