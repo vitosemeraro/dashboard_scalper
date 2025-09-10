@@ -57,6 +57,7 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> str:
     raise KeyError(f"Colonna non trovata: {candidates}")
 
 def sanitize_orders(df_raw: pd.DataFrame) -> pd.DataFrame:
+    # Tieni solo BUY/SELL e normalizza nomi colonna
     type_col = _find_col(df_raw, ["Type"])
     df = df_raw[df_raw[type_col].isin(["BUY", "SELL"])].copy()
 
@@ -85,6 +86,7 @@ def sanitize_orders(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def fifo_trades(orders: pd.DataFrame, pair: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Accoppia BUY->SELL in FIFO, consentendo split (parziali)."""
     df = orders[orders["pair"] == pair].copy()
     if df.empty:
         return [], {"start": None, "end": None, "totalMoved": 0.0}
@@ -101,7 +103,7 @@ def fifo_trades(orders: pd.DataFrame, pair: str) -> Tuple[List[Dict[str, Any]], 
                 b = buy_q[0]
                 take = float(min(b["qty"], sell_qty))
                 pnl = (float(o["price"]) - float(b["price"])) * take
-                size_usdc = take * float(b["price"])  # size valorizzata a prezzo di carico
+                size_usdc = take * float(b["price"])  # size valorizzata al prezzo di carico
                 dur_min = (o["date"] - b["date"]).total_seconds() / 60.0
                 trades.append({
                     "buy_date": b["date"],
@@ -133,23 +135,26 @@ def compute_kpis(trades: List[Dict[str, Any]], meta: Dict[str, Any], residual: D
     success_rate = float(100.0 * sum(1 for t in trades if t["pnl"] > 0) / trades_n) if trades_n else 0.0
     avg_dur = float(np.mean([t["dur_min"] for t in trades])) if trades else 0.0
 
-    residual_block = {"cost": 0.0, "value": 0.0, "pnl": 0.0}
+    # Residuo
+    residual_block = {"qty": 0.0, "avgCost": 0.0, "targetPrice": 0.0, "cost": 0.0, "value": 0.0, "pnl": 0.0}
     if residual and residual.get("qty"):
-        residual_block["cost"] = residual["qty"] * residual.get("avgCost", 0)
-        residual_block["value"] = residual["qty"] * residual.get("targetPrice", 0)
+        residual_block["qty"] = float(residual["qty"])
+        residual_block["avgCost"] = float(residual.get("avgCost", 0))
+        residual_block["targetPrice"] = float(residual.get("targetPrice", 0))
+        residual_block["cost"] = residual_block["qty"] * residual_block["avgCost"]
+        residual_block["value"] = residual_block["qty"] * residual_block["targetPrice"]
         residual_block["pnl"] = residual_block["value"] - residual_block["cost"]
 
     total_with_residual = total_pnl + residual_block["pnl"]
 
     start = meta.get("start")
     end = meta.get("end")
+    months = 1
     if start and end:
         months = (end.year - start.year) * 12 + (end.month - start.month) + 1
-    else:
-        months = 1
     monthly_avg = total_with_residual / max(1, months)
 
-    # Ultimi 10 giorni basati sulla SELL date
+    # Ultimi 10 giorni (sulla sell_date)
     last10 = []
     last10_pnl = 0.0
     if end:
@@ -159,7 +164,9 @@ def compute_kpis(trades: List[Dict[str, Any]], meta: Dict[str, Any], residual: D
 
     return {
         "period": {"start": start, "end": end},
-        "pnl": {"totalWithResidual": round(total_with_residual, 2), "residual": residual_block},
+        "pnl": {"total": round(total_pnl, 2),
+                "totalWithResidual": round(total_with_residual, 2),
+                "residual": residual_block},
         "bestTrade": best,
         "worstTrade": worst,
         "counts": {"trades": trades_n, "successRatePct": round(success_rate, 2)},
@@ -173,18 +180,32 @@ def compute_kpis(trades: List[Dict[str, Any]], meta: Dict[str, Any], residual: D
 def format_number(x: float) -> str:
     return f"{x:,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
 
+def format_duration(mins: float | int) -> str:
+    """Converte minuti in stringa leggibile: min / ore / giorni."""
+    if mins is None:
+        return "-"
+    mins = float(mins)
+    if mins < 60:
+        return f"~{format_number(mins)} min"
+    hours = mins / 60
+    if hours < 24:
+        return f"~{format_number(hours)} h"
+    days = hours / 24
+    return f"~{format_number(days)} giorni"
+
 # ---------------------- UI ----------------------
-st.sidebar.header("⚙️ Input")
-drive_url = st.sidebar.text_input("Link Google Drive/Sheets del file XLSX", placeholder="https://docs.google.com/spreadsheets/d/.../edit")
-uploaded = st.sidebar.file_uploader("oppure carica .xlsx", type=["xlsx"])
-pair = st.sidebar.text_input("Coppia", value=PAIR_DEFAULT)
-st.sidebar.divider()
-st.sidebar.subheader("Residuo (opzionale)")
-res_qty = st.sidebar.number_input("Qty residua", value=15.0, step=1.0)
-res_avg = st.sidebar.number_input("Prezzo medio residuo", value=201.0, step=0.1)
-res_target = st.sidebar.number_input("Prezzo target residuo", value=220.0, step=0.1)
-st.sidebar.divider()
-go = st.sidebar.button("Calcola KPI", type="primary")
+with st.sidebar:
+    st.header("⚙️ Input")
+    drive_url = st.text_input("Link Google Drive/Sheets del file XLSX", placeholder="https://docs.google.com/spreadsheets/d/.../edit")
+    uploaded = st.file_uploader("oppure carica .xlsx", type=["xlsx"])
+    pair = st.text_input("Coppia", value=PAIR_DEFAULT)
+    st.divider()
+    st.subheader("Residuo (opzionale)")
+    res_qty = st.number_input("Qty residua", value=15.0, step=1.0)
+    res_avg = st.number_input("Prezzo medio residuo", value=201.0, step=0.1)
+    res_target = st.number_input("Prezzo target residuo", value=220.0, step=0.1)
+    st.divider()
+    go = st.button("Calcola KPI", type="primary")
 
 if not go:
     st.info("⬅️ Inserisci link o carica il file e premi **Calcola KPI** dal menu a sinistra.")
@@ -229,26 +250,43 @@ else:
     residual_cfg = {"qty": res_qty, "avgCost": res_avg, "targetPrice": res_target}
     result = compute_kpis(trades, meta, residual_cfg)
 
-    # --- Output KPI ---
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("PNL totale (con residuo)", f"{format_number(result['pnl']['totalWithResidual'])} USDC")
-        st.metric("Numero di trade", result["counts"]["trades"])
-        st.metric("Success rate", f"{format_number(result['counts']['successRatePct'])}%")
-    with col2:
-        st.metric("Size media per trade", f"{format_number(result['sizes']['avgTradeUSDC'])} USDC")
-        st.metric("PNL medio per trade", f"{format_number(result['perTrade']['avgPnl'])} USDC")
-        st.metric("Totale USDC mossi", f"{format_number(result['sizes']['totalUSDCMoved'])} USDC")
-    with col3:
+    # ======== HEADER: Data inizio / fine ========
+    header1, header2, _ = st.columns([1,1,2])
+    with header1:
         start = result['period']['start']
-        end = result['period']['end']
         st.metric("Data inizio", start.strftime('%d/%m/%Y %H:%M') if start else '-')
+    with header2:
+        end = result['period']['end']
         st.metric("Data fine", end.strftime('%d/%m/%Y %H:%M') if end else '-')
-        st.metric("Guadagno mensile medio", f"{format_number(result['monthlyAvgGain'])} USDC")
 
     st.divider()
 
-    # Miglior/Peggior trade
+    # ======== KPI principali (layout e ordine richiesto) ========
+    # Colonna sinistra: PNL totale (con residuo), Numero trade, Success rate
+    col_left, col_mid, col_right = st.columns(3)
+    with col_left:
+        st.metric("PNL totale (con residuo)", f"{format_number(result['pnl']['totalWithResidual'])} USDC")
+        st.metric("Numero di trade", result["counts"]["trades"])
+        st.metric("Success rate", f"{format_number(result['counts']['successRatePct'])}%")
+
+    # Colonna centrale: Totale USDC mossi -> Guadagno mensile -> PNL medio per trade -> Valore residuo (ultimo)
+    with col_mid:
+        st.metric("Totale USDC mossi", f"{format_number(result['sizes']['totalUSDCMoved'])} USDC")
+        st.metric("Guadagno mensile medio", f"{format_number(result['monthlyAvgGain'])} USDC")
+        st.metric("PNL medio per trade", f"{format_number(result['perTrade']['avgPnl'])} USDC")
+        st.metric("Valore residuo a target", f"{format_number(result['pnl']['residual']['value'])} USDC")
+
+    # Colonna destra: altre utili – Size media, Durata media (formattata), PNL totale (senza residuo) e info residuo
+    with col_right:
+        st.metric("Size media per trade", f"{format_number(result['sizes']['avgTradeUSDC'])} USDC")
+        st.metric("Durata media trade", format_duration(result['perTrade']['avgDurationMin']))
+        st.metric("PNL totale (senza residuo)", f"{format_number(result['pnl']['total'])} USDC")
+
+    st.caption(f"Residuo: {int(result['pnl']['residual']['qty'])} SOL @ {format_number(result['pnl']['residual']['avgCost'])} → target {format_number(result['pnl']['residual']['targetPrice'])} | PnL residuo: {format_number(result['pnl']['residual']['pnl'])} USDC")
+
+    st.divider()
+
+    # ======== Miglior/Peggior trade ========
     b = result.get("bestTrade")
     w = result.get("worstTrade")
     c1, c2 = st.columns(2)
@@ -257,7 +295,7 @@ else:
         if b:
             st.write(f"PnL: **{format_number(b['pnl'])} USDC**  |  Size: {format_number(b['size_usdc'])} USDC")
             st.write(f"Buy: {pd.to_datetime(b['buy_date']).strftime('%d/%m/%Y %H:%M')}  →  Sell: {pd.to_datetime(b['sell_date']).strftime('%d/%m/%Y %H:%M')}")
-            st.write(f"Durata: ~{format_number(b['dur_min'])} min")
+            st.write(f"Durata: {format_duration(b['dur_min'])}")
         else:
             st.write("-")
     with c2:
@@ -265,13 +303,13 @@ else:
         if w:
             st.write(f"PnL: **{format_number(w['pnl'])} USDC**  |  Size: {format_number(w['size_usdc'])} USDC")
             st.write(f"Buy: {pd.to_datetime(w['buy_date']).strftime('%d/%m/%Y %H:%M')}  →  Sell: {pd.to_datetime(w['sell_date']).strftime('%d/%m/%Y %H:%M')}")
-            st.write(f"Durata: ~{format_number(w['dur_min'])} min")
+            st.write(f"Durata: {format_duration(w['dur_min'])}")
         else:
             st.write("-")
 
     st.divider()
 
-    # Ultimi 10 giorni
+    # ======== Ultimi 10 giorni ========
     st.subheader("🗓️ Ultimi 10 giorni")
     end = result['period']['end']
     if end:
@@ -288,8 +326,10 @@ else:
                 "sell_price":"Prezzo Sell",
                 "size_usdc":"Size (USDC)",
                 "pnl":"PnL (USDC)",
-                "dur_min":"Durata (min)"
+                "dur_min":"Durata"
             }, inplace=True)
+            # Format durations
+            df10["Durata"] = df10["Durata"].map(format_duration)
             st.dataframe(df10, use_container_width=True)
             st.info(f"PnL ultimi 10gg: **{format_number(result['last10d']['pnl'])} USDC** su {len(last10)} trade")
         else:
@@ -297,5 +337,5 @@ else:
     else:
         st.write("Periodo non disponibile.")
 
-    # Download JSON
+    # ======== Download JSON ========
     st.download_button("⬇️ Scarica JSON KPI", data=pd.Series(result).to_json(), file_name="kpi_report.json", mime="application/json")
